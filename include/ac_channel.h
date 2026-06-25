@@ -111,6 +111,7 @@ struct ac_channel_exception
       fifo_not_empty_when_reset,
       no_operator_sb_defined_for_channel_type,
       no_insert_defined_for_channel_type,
+      no_peek_defined_for_channel_type,
       no_size_in_connections,
       no_num_free_in_connections,
       no_output_empty_in_connections,
@@ -122,6 +123,7 @@ struct ac_channel_exception
                                       "fifo not empty when reset",
                                       "No operator[] defined for channel type",
                                       "No insert defined for channel type",
+                                      "No peek defined for channel type",
                                       "Connections does not support size()",
                                       "Connections does not support num_free()",
                                       "Connections::Out does not support empty()",
@@ -164,6 +166,19 @@ class ac_channel
    __FORCE_INLINE bool nb_read(T& t)
    {
       return chan.nb_read(t);
+   }
+
+   __FORCE_INLINE T peek()
+   {
+      return chan.peek();
+   }
+   __FORCE_INLINE void peek(T& t)
+   {
+      t = peek();
+   }
+   __FORCE_INLINE bool nb_peek(T& t)
+   {
+      return chan.nb_peek(t);
    }
 
    __FORCE_INLINE void write(const T& t)
@@ -315,6 +330,12 @@ class ac_channel
       template <class T0>
       const T0 _read_bambu_internal(bool& res, bool& dummy);
       template <class T0>
+      const T0 _peek_bambu_internal(void);
+      template <class T0>
+      const T0 _peek_bambu_internal(bool& res);
+      template <class T0>
+      const T0 _peek_bambu_internal(bool& res, bool& dummy);
+      template <class T0>
       bool _write_bambu_internal(T0 t);
 #else
       struct fifo_abstract
@@ -323,6 +344,8 @@ class ac_channel
          virtual fifo_type get_fifo_type() const = 0;
          virtual T read() = 0;
          virtual bool nb_read(T& t) = 0;
+         virtual T peek() = 0;
+         virtual bool nb_peek(T& t) = 0;
          virtual void write(const T& t) = 0;
          virtual bool nb_write(T& t) = 0;
          virtual bool empty() = 0;
@@ -382,6 +405,15 @@ class ac_channel
          bool nb_read(T& t)
          {
             return empty() ? false : (t = read(), true);
+         }
+         T peek()
+         {
+            AC_CHANNEL_ASSERT(!empty(), ac_channel_exception::read_from_empty_channel);
+            return ch.front();
+         }
+         bool nb_peek(T& t)
+         {
+            return empty() ? false : (t = peek(), true);
          }
 
          void write(const T& t)
@@ -457,6 +489,16 @@ class ac_channel
          bool nb_read(T& t)
          {
             return empty() ? false : (t = read(), true);
+         }
+         T peek()
+         {
+            AC_CHANNEL_ASSERT(0, ac_channel_exception::no_peek_defined_for_channel_type);
+            return *static_cast<T*>(nullptr);
+         }
+         bool nb_peek(T&)
+         {
+            AC_CHANNEL_ASSERT(0, ac_channel_exception::no_peek_defined_for_channel_type);
+            return false;
          }
 
          void write(const T& t)
@@ -536,6 +578,16 @@ class ac_channel
          {
             return fifo_in->PopNB(t);
          }
+         T peek()
+         {
+            AC_CHANNEL_ASSERT(0, ac_channel_exception::no_peek_defined_for_channel_type);
+            return *static_cast<T*>(nullptr);
+         }
+         bool nb_peek(T&)
+         {
+            AC_CHANNEL_ASSERT(0, ac_channel_exception::no_peek_defined_for_channel_type);
+            return false;
+         }
 
          void write(const T& t)
          {
@@ -607,6 +659,16 @@ class ac_channel
          {
             t = true;
             return (sync_in->nb_sync_in());
+         }
+         T peek()
+         {
+            AC_CHANNEL_ASSERT(0, ac_channel_exception::no_peek_defined_for_channel_type);
+            return *static_cast<T*>(nullptr);
+         }
+         bool nb_peek(T&)
+         {
+            AC_CHANNEL_ASSERT(0, ac_channel_exception::no_peek_defined_for_channel_type);
+            return false;
          }
 
          void write(const T& t)
@@ -750,6 +812,49 @@ class ac_channel
       }
 #endif
 #if __clang_major__ >= 16
+      template <class T0, std::enable_if_t<std::is_same<T, T0>::value, bool> = true>
+      __FORCE_INLINE void _peek0(T0& t)
+      {
+         enum
+         {
+            _BitWidth0 = 8 * sizeof(T0)
+         };
+         bambu_bitcast_payload<T0, _BitWidth0> payload;
+         payload.bits = _peek_bambu_internal<unsigned _BitInt(_BitWidth0)>();
+         t = payload.object;
+      }
+#else
+      template <class T0, std::enable_if_t<std::is_same<T, T0>::value, bool> = true>
+      __FORCE_INLINE void _peek0(T0& t)
+      {
+         t = _peek_bambu_internal<T0>();
+      }
+#endif
+#if __clang_major__ >= 16
+      template <class T0, std::enable_if_t<std::is_same<T, T0>::value, bool> = true>
+      __FORCE_INLINE void _peek0(T0& t, bool& cond)
+      {
+         enum
+         {
+            _BitWidth0 = 8 * sizeof(T0)
+         };
+         bool cond0;
+         unsigned _BitInt(_BitWidth0 + 1) res = _peek_bambu_internal<unsigned _BitInt(_BitWidth0 + 1)>(cond0);
+         unsigned char cond1 = (res >> ((unsigned _BitInt(_BitWidth0 + 1)) _BitWidth0)) & 1;
+         cond = cond1;
+         bambu_bitcast_payload<T0, _BitWidth0> payload;
+         payload.bits = res;
+         t = payload.object;
+      }
+#else
+      template <class T0, std::enable_if_t<std::is_same<T, T0>::value, bool> = true>
+      __FORCE_INLINE void _peek0(T0& t, bool& cond)
+      {
+         bool dummy;
+         t = _peek_bambu_internal<T0>(cond, dummy);
+      }
+#endif
+#if __clang_major__ >= 16
       template <int W, bool S, std::enable_if_t<std::is_same<T, ac_int<W, S>>::value, bool> = true>
       __FORCE_INLINE void _read0(ac_int<W, S>& t)
       {
@@ -782,6 +887,38 @@ class ac_channel
          unsigned _BitInt(W) val = res;
          t.from_BitInt(val);
       }
+      template <int W, bool S, std::enable_if_t<std::is_same<T, ac_int<W, S>>::value, bool> = true>
+      __FORCE_INLINE void _peek0(ac_int<W, S>& t)
+      {
+         unsigned _BitInt(W) res = _peek_bambu_internal<unsigned _BitInt(W)>();
+         t.from_BitInt(res);
+      }
+      template <int W, int I, bool S = true, ac_q_mode Q = AC_TRN, ac_o_mode O = AC_WRAP,
+                std::enable_if_t<std::is_same<T, ac_fixed<W, I, S, Q, O>>::value, bool> = true>
+      __FORCE_INLINE void _peek0(ac_fixed<W, I, S, Q, O>& t)
+      {
+         unsigned _BitInt(W) res = _peek_bambu_internal<unsigned _BitInt(W)>();
+         t.from_BitInt(res);
+      }
+      template <int W, bool S, std::enable_if_t<std::is_same<T, ac_int<W, S>>::value, bool> = true>
+      __FORCE_INLINE void _peek0(ac_int<W, S>& t, bool& cond)
+      {
+         bool cond0;
+         unsigned _BitInt(W + 1) res = _peek_bambu_internal<unsigned _BitInt(W + 1)>(cond0);
+         cond = (res >> ((unsigned _BitInt(W + 1)) W)) & 1;
+         unsigned _BitInt(W) val = res;
+         t.from_BitInt(val);
+      }
+      template <int W, int I, bool S = true, ac_q_mode Q = AC_TRN, ac_o_mode O = AC_WRAP,
+                std::enable_if_t<std::is_same<T, ac_fixed<W, I, S, Q, O>>::value, bool> = true>
+      __FORCE_INLINE void _peek0(ac_fixed<W, I, S, Q, O>& t, bool& cond)
+      {
+         bool cond0;
+         unsigned _BitInt(W + 1) res = _peek_bambu_internal<unsigned _BitInt(W + 1)>(cond0);
+         cond = (res >> ((unsigned _BitInt(W + 1)) W)) & 1;
+         unsigned _BitInt(W) val = res;
+         t.from_BitInt(val);
+      }
 #endif
 
 #endif
@@ -802,6 +939,24 @@ class ac_channel
          bool res;
          T temp;
          _read0(temp, res);
+         t = res ? temp : t;
+         return res;
+      }
+
+      ///// peek
+      __FORCE_INLINE T peek()
+      {
+         T val;
+         _peek0(val);
+         return val;
+      }
+
+      ///// nb_peek
+      __FORCE_INLINE bool nb_peek(T& t)
+      {
+         bool res;
+         T temp;
+         _peek0(temp, res);
          t = res ? temp : t;
          return res;
       }
@@ -909,6 +1064,14 @@ class ac_channel
       inline bool nb_read(T& t)
       {
          return f->nb_read(t);
+      }
+      inline T peek()
+      {
+         return f->peek();
+      }
+      inline bool nb_peek(T& t)
+      {
+         return f->nb_peek(t);
       }
 
       inline void write(const T& t)
