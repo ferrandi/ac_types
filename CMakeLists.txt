@@ -23,6 +23,7 @@ set(AC_TYPES_HEADERS
    include/ap_int.h
    include/ap_shift_reg.h
    include/hls_stream.h
+   include/ac_compat.h
 )
 set(AC_TYPES_UTIL
    include/utils/x_hls_utils.h

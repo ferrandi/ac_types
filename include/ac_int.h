@@ -128,6 +128,8 @@
 #define __FORCE_INLINE __attribute__((always_inline)) inline
 #endif
 
+#include "ac_compat.h"
+
 /*#define __INIT_VALUE = {0}*/
 /*#define __INIT_VALUE_LL = {0}*/
 

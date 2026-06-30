@@ -50,6 +50,8 @@
 #error C++ is required to include this header file
 #endif
 
+#include "ac_compat.h"
+
 #include <deque>
 #include <fstream>
 #include <initializer_list>
