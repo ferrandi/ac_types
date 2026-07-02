@@ -57,9 +57,6 @@ namespace hls
 
 #if !defined(__BAMBU__) || defined(__BAMBU_SIM__)
    stream(const stream<T, DEPTH> &) = default;
-   stream(int init) : ac_channel<T>(init) {}
-   stream(int init, T val) : ac_channel<T>(init, val) {}
-   stream(std::initializer_list<T> val) : ac_channel<T>(val) {}
    stream &operator=(const stream<T, DEPTH> &) = default;
 #endif
 
@@ -77,7 +74,7 @@ namespace hls
 
       bool full()
       {
-         return DEPTH == 0 ? false : (DEPTH == this->size());
+         return has_static_depth() ? (this->size() >= static_cast<unsigned int>(DEPTH)) : false;
       }
 
       bool read_nb(T& head)
@@ -85,9 +82,17 @@ namespace hls
          return this->nb_read(head);
       }
 
+#if !defined(__BAMBU__) || defined(__BAMBU_SIM__)
+      void write(const T& wdata)
+      {
+         depth_assert(!reached_static_depth(), __FILE__, __LINE__);
+         base_type::write(wdata);
+      }
+#endif
+
       bool write_nb(T& tail)
       {
-         return this->nb_write(tail);
+         return full() ? false : base_type::nb_write(tail);
       }
 
       bool write_nb(const T& tail)
@@ -101,6 +106,47 @@ namespace hls
       }
 
     private:
+      static constexpr bool has_static_depth()
+      {
+         return DEPTH > 0;
+      }
+
+#if !defined(__BAMBU__) || defined(__BAMBU_SIM__)
+      static void depth_assert(bool condition, const char* file, int line)
+      {
+#ifndef AC_USER_DEFINED_ASSERT
+         if(!condition)
+         {
+            const ac_exception e(file, line, ac_channel_exception::write_to_full_channel,
+                                 ac_channel_exception::msg(ac_channel_exception::write_to_full_channel));
+#ifdef AC_ASSERT_THROW_EXCEPTION
+#ifdef AC_ASSERT_THROW_EXCEPTION_AS_CONST_CHAR
+            throw(e.msg);
+#else
+            throw(e);
+#endif
+#else
+            std::cerr << "Assert";
+            if(e.file)
+            {
+               std::cerr << " in file " << e.file << ":" << e.line;
+            }
+            std::cerr << " " << e.msg << std::endl;
+            assert(0);
+#endif
+         }
+#else
+         AC_USER_DEFINED_ASSERT(condition, file, line,
+                                ac_channel_exception::msg(ac_channel_exception::write_to_full_channel));
+#endif
+      }
+
+      bool reached_static_depth() const
+      {
+         return has_static_depth() && this->debug_size() >= static_cast<unsigned int>(DEPTH);
+      }
+#endif
+
 #if defined(__BAMBU__) && !defined(__BAMBU_SIM__)
       stream(const stream&) = delete;
       stream& operator=(const stream&) = delete;
