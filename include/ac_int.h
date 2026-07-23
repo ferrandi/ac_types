@@ -3799,21 +3799,26 @@ using Slong = long long;
                if(msb_v == lsb_v)
                {
                   v.set(lsb_v,
-                        v[lsb_v] ^ ((v[lsb_v] ^ (op2.v[0] << lsb_b)) & ((WS == 32 ? ~0 : ((1u << WS) - 1)) << lsb_b)));
+                        v[lsb_v] ^ ((v[lsb_v] ^ (static_cast<unsigned>(op2.v[0]) << lsb_b)) &
+                                    ((WS == 32 ? ~0 : ((1u << WS) - 1)) << lsb_b)));
                }
                else
                {
-                  v.set(lsb_v, v[lsb_v] ^ ((v[lsb_v] ^ (op2.v[0] << lsb_b)) & (all_ones << lsb_b)));
+                  v.set(lsb_v,
+                        v[lsb_v] ^ ((v[lsb_v] ^ (static_cast<unsigned>(op2.v[0]) << lsb_b)) & (all_ones << lsb_b)));
                   unsigned m = (((unsigned)op2.v[0] >> 1) >> (31 - lsb_b));
                   v.set(msb_v, v[msb_v] ^ ((v[msb_v] ^ m) & ~((all_ones << 1) << msb_b)));
                }
             }
             else
             {
-               v.set(lsb_v, v[lsb_v] ^ ((v[lsb_v] ^ (op2.v[0] << lsb_b)) & (all_ones << lsb_b)));
-               LOOP(int, i, 1, exclude, N2 - 1,
-                    { v.set(lsb_v + i, (op2.v[i] << lsb_b) | (((unsigned)op2.v[i - 1] >> 1) >> (31 - lsb_b))); });
-               unsigned t = (op2.v[N2 - 1] << lsb_b) | (((unsigned)op2.v[N2 - 2] >> 1) >> (31 - lsb_b));
+               v.set(lsb_v, v[lsb_v] ^ ((v[lsb_v] ^ (static_cast<unsigned>(op2.v[0]) << lsb_b)) & (all_ones << lsb_b)));
+               LOOP(int, i, 1, exclude, N2 - 1, {
+                  v.set(lsb_v + i,
+                        (static_cast<unsigned>(op2.v[i]) << lsb_b) | (((unsigned)op2.v[i - 1] >> 1) >> (31 - lsb_b)));
+               });
+               unsigned t =
+                   (static_cast<unsigned>(op2.v[N2 - 1]) << lsb_b) | (((unsigned)op2.v[N2 - 2] >> 1) >> (31 - lsb_b));
                unsigned m = t;
                if(msb_v - lsb_v == N2)
                {
