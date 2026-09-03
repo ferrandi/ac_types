@@ -45,6 +45,13 @@
 // There are no explicit instantiations here and none are needed. The seam entries are member templates,
 // so every host translation unit instantiates exactly the ones it calls, with vague linkage the linker
 // folds - including for element types this header has never seen.
+//
+// That also covers the kernel that arrives already compiled (a .ll, an object). Nothing in it can order
+// the host bodies - its seam calls are undefined and objcopy --weaken turns them into weak undefined, so
+// the gold would call address 0 - but such a producer has to hand bambu the C++ file that defines the
+// channel layout and the entry points anyway. Compiling that file host-side, with this header included,
+// orders exactly the operations the kernel performs. Pass it with a second --generate-tb; see
+// documentation/ac_channel_abi.md.
 
 #ifndef __AC_CHANNEL_SIM_H
 #define __AC_CHANNEL_SIM_H
@@ -198,40 +205,6 @@ __attribute__((noinline)) bool ac_channel<T>::_write_bambu_internal(T0 t)
    ch.push_back(v);
    return true;
 }
-
-/////////////////////////////////////////////////
-// Instantiation point, for a kernel that arrives already compiled
-/////////////////////////////////////////////////
-
-// A host translation unit only emits the seam entries it calls. In the normal flow that is exactly
-// right: the gold is the user source recompiled, so it orders precisely what the design performs.
-// When the kernel arrives as a .ll or an object instead, nothing on the host mentions the operations
-// only the kernel does - a kernel calling nb_peek leaves _peek_bambu_internal undefined, and since it
-// is weak the linker resolves it to zero and the gold jumps there. Naming them all once per element
-// type fixes it:
-//
-//     template struct ac_channel_instantiate<ap_uint<16>>;
-//
-// anchor() is never meant to be called, only instantiated, so the reads it performs on an empty
-// channel never happen.
-template <class T>
-struct ac_channel_instantiate
-{
-   static void anchor(ac_channel<T>& c)
-   {
-      T t = T();
-      bool ok;
-      c.write(t);
-      ok = c.nb_write(t);
-      t = c.read();
-      c.read(t);
-      ok = c.nb_read(t);
-      t = c.peek();
-      c.peek(t);
-      ok = c.nb_peek(t);
-      (void)ok;
-   }
-};
 
 #endif // __cplusplus
 
