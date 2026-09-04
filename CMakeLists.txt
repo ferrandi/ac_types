@@ -14,7 +14,6 @@ set(AC_TYPES_DATA_FILES
 
 set(AC_TYPES_HEADERS
    include/ac_channel.h
-   include/ac_channel_sim.h
    include/ac_complex.h
    include/ac_fixed.h
    include/ac_float.h
