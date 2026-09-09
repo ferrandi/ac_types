@@ -41,6 +41,7 @@
 //  Original Author:  Andres Takach, Ph.D.
 //  Modified by:      Fabrizio Ferrandi <fabrizio.ferrandi@polimi.it>
 //                    Michele Fiorito <michele.fiorito@polimi.it>
+//                    Tommaso Fellegara <tommaso.fellegara@polimi.it>
 */
 
 #ifndef __AC_CHANNEL_H
@@ -55,15 +56,10 @@
 #include <deque>
 #include <fstream>
 #include <initializer_list>
-#if !defined(__BAMBU__) || defined(__BAMBU_SIM__)
-#include <iostream>
-#endif
-#include <string>
+#include <ostream>
 
-#if defined(__BAMBU__) && !defined(__BAMBU_SIM__)
 #include "ac_fixed.h"
 #include "ac_int.h"
-#endif
 
 #if !defined(AC_USER_DEFINED_ASSERT) && !defined(AC_ASSERT_THROW_EXCEPTION)
 #include <cassert>
@@ -72,6 +68,7 @@
 // not directly used by this include
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 // Macro Definitions (obsolete - provided here for backward compatibility)
 #define AC_CHAN_CTOR(varname) varname
@@ -135,151 +132,294 @@ struct ac_channel_exception
 };
 
 ///////////////////////////////////////////
-// Class: ac_channel
-//////////////////////////////////////////
+// Traits: how T travels over the channel
+///////////////////////////////////////////
 
+// Logical width of T on the wire. For a plain type that is its whole object representation; ac_int and
+// ac_fixed carry fewer bits than they occupy, and only those go over the channel.
+template <class T>
+struct ac_channel_packed
+{
+   enum
+   {
+      bits = 8 * sizeof(T)
+   };
+};
+
+template <int W, bool S>
+struct ac_channel_packed<ac_int<W, S>>
+{
+   enum
+   {
+      bits = W
+   };
+};
+
+template <int W, int I, bool S, ac_q_mode Q, ac_o_mode O>
+struct ac_channel_packed<ac_fixed<W, I, S, Q, O>>
+{
+   enum
+   {
+      bits = W
+   };
+};
+
+// True when the object representation is wider than the logical width, which is the only case where the
+// payload has to be built from the value rather than copied from it.
+template <class T>
+struct ac_channel_is_ac
+{
+   enum
+   {
+      value = 0
+   };
+};
+
+template <int W, bool S>
+struct ac_channel_is_ac<ac_int<W, S>>
+{
+   enum
+   {
+      value = 1
+   };
+};
+
+template <int W, int I, bool S, ac_q_mode Q, ac_o_mode O>
+struct ac_channel_is_ac<ac_fixed<W, I, S, Q, O>>
+{
+   enum
+   {
+      value = 1
+   };
+};
+
+///////////////////////////////////////////
+// Class: ac_channel
+///////////////////////////////////////////
+
+// One class and one object layout are shared by synthesis and host simulation:
+//
+//   FIFO API -> payload adapters -> Bambu ABI seam
+//
+// During synthesis the seam has no body, so InterfaceInfer can replace its calls with FIFO ports. On
+// the host its definitions operate on the deque. Methods outside the FIFO API are software-only and
+// access the deque directly. See documentation/ac_channel_abi.md for the complete ABI rationale.
 template <class T>
 class ac_channel
 {
  public:
    using element_type = T;
 
-   // constructors
-   ac_channel();
-#if !defined(__BAMBU__) || defined(__BAMBU_SIM__)
-   ac_channel(const ac_channel<T>&) = default;
+   /////////////////////////////////////////////////
+   // Construction and copying
+   /////////////////////////////////////////////////
 
+   ac_channel();
    ac_channel(int init);
    ac_channel(int init, T val);
    ac_channel(std::initializer_list<T> val);
    ac_channel(const char* bin_file);
-
+   ac_channel(const ac_channel<T>&) = default;
    ac_channel& operator=(const ac_channel<T>&) = default;
-#endif
 
+   /////////////////////////////////////////////////
+   // FIFO API: rewritten by Bambu during synthesis
+   /////////////////////////////////////////////////
+
+   // Keep this API non-template so implicit conversions happen before the private payload adapters.
    __FORCE_INLINE T read()
    {
-      return chan.read();
+      T val;
+      _read0(val);
+      return val;
    }
-   __FORCE_INLINE void read(T& t)
+   __FORCE_INLINE void read(T& value)
    {
-      t = read();
+      value = read();
    }
-   __FORCE_INLINE bool nb_read(T& t)
+   __FORCE_INLINE bool nb_read(T& value)
    {
-      return chan.nb_read(t);
+      bool valid;
+      T temp;
+      _read0(temp, valid);
+      value = valid ? temp : value;
+      return valid;
    }
 
    __FORCE_INLINE T peek()
    {
-      return chan.peek();
+      T val;
+      _peek0(val);
+      return val;
    }
-   __FORCE_INLINE void peek(T& t)
+   __FORCE_INLINE void peek(T& value)
    {
-      t = peek();
+      value = peek();
    }
-   __FORCE_INLINE bool nb_peek(T& t)
+   __FORCE_INLINE bool nb_peek(T& value)
    {
-      return chan.nb_peek(t);
+      bool valid;
+      T temp;
+      _peek0(temp, valid);
+      value = valid ? temp : value;
+      return valid;
    }
 
-   __FORCE_INLINE void write(const T& t)
+   __FORCE_INLINE void write(const T& value)
    {
-      chan.write(t);
+      _write0(value);
    }
-   __FORCE_INLINE bool nb_write(T& t)
+   __FORCE_INLINE bool nb_write(T& value)
    {
 #if !defined(__BAMBU__) || defined(__BAMBU_SIM__)
-      chan.incr_size_call_count();
+      ++size_call_count;
 #endif
-      return chan.nb_write(t);
+      return _nb_write0(value);
    }
+
+   /////////////////////////////////////////////////
+   // Software-only queue inspection and reset
+   /////////////////////////////////////////////////
 
    __FORCE_INLINE unsigned int size()
    {
 #if !defined(__BAMBU__) || defined(__BAMBU_SIM__)
-      chan.incr_size_call_count();
+      ++size_call_count;
 #endif
-      return chan.size();
+      return static_cast<unsigned int>(ch.size());
    }
 
-#if !defined(__BAMBU__) || defined(__BAMBU_SIM__)
    __FORCE_INLINE bool empty()
    {
-      return chan.empty();
+      return ch.empty();
    }
 
-   __FORCE_INLINE unsigned int num_free()
+   __FORCE_INLINE unsigned int num_free() const
    {
-      return chan.num_free();
+      return static_cast<unsigned int>(ch.max_size() - ch.size());
    }
 
    // Return true if channel has at least k entries
    __FORCE_INLINE bool available(unsigned int k) const
    {
-      return chan.available(k);
+      return ch.size() >= k;
    }
 
    __FORCE_INLINE void reset()
    {
-      chan.reset();
+      ch.clear();
+      for(unsigned int i = 0; i < rSz; ++i)
+      {
+         ch.push_back(rVal);
+      }
    }
 
    __FORCE_INLINE unsigned int debug_size() const
    {
-      return chan.size();
+      return static_cast<unsigned int>(ch.size());
    }
 
    __FORCE_INLINE const T& operator[](unsigned int pos) const
    {
-      return chan[pos];
+      return ch[pos];
    }
 
    __FORCE_INLINE T& operator[](unsigned int pos)
    {
-      return chan[pos];
+      return ch[pos];
    }
 
    __FORCE_INLINE int get_size_call_count()
    {
-      return chan.get_size_call_count();
+      int tmp = size_call_count;
+      size_call_count = 0;
+      return tmp;
    }
-#endif
 
-#ifdef SYSTEMC_INCLUDED
-   __FORCE_INLINE void bind(sc_core::sc_fifo_in<T>& f)
+   /////////////////////////////////////////////////
+   // Legacy iterator API
+   /////////////////////////////////////////////////
+
+   // Obsolete, kept for backward compatibility with ac_channel.
+   struct iterator
    {
-      chan.bind(f);
+      iterator operator+(unsigned int pos_) const
+      {
+         return iterator(itr, pos_);
+      }
+
+    private:
+      friend class ac_channel;
+      iterator(const typename std::deque<T>::iterator& itr_, unsigned int pos = 0) : itr(itr_)
+      {
+         if(pos)
+         {
+            itr += pos;
+         }
+      }
+      typename std::deque<T>::iterator itr;
+   };
+   __FORCE_INLINE iterator begin()
+   {
+      return iterator(ch.begin());
    }
-   __FORCE_INLINE void bind(sc_core::sc_fifo_out<T>& f)
+   __FORCE_INLINE void insert(iterator itr, const T& value)
    {
-      chan.bind(f);
+      ch.insert(itr.itr, value);
+   }
+
+   /////////////////////////////////////////////////
+   // Unsupported external backends
+   /////////////////////////////////////////////////
+
+   // SystemC and Connections used alternate storage implementations. The unified deque does not support
+   // them; fail only when bind() is instantiated. The previous implementation is at git revision abb773b.
+#ifdef SYSTEMC_INCLUDED
+   __FORCE_INLINE void bind(sc_core::sc_fifo_in<T>&)
+   {
+      static_assert(sizeof(T) == 0, "ac_channel: SystemC binding is not supported by this build");
+   }
+   __FORCE_INLINE void bind(sc_core::sc_fifo_out<T>&)
+   {
+      static_assert(sizeof(T) == 0, "ac_channel: SystemC binding is not supported by this build");
    }
 #endif
 
 #ifdef __CONNECTIONS__CONNECTIONS_H__
-   __FORCE_INLINE void bind(Connections::Out<T>& c)
+   __FORCE_INLINE void bind(Connections::Out<T>&)
    {
-      chan.bind(c);
+      static_assert(sizeof(T) == 0, "ac_channel: Connections binding is not supported by this build");
    }
-   __FORCE_INLINE void bind(Connections::In<T>& c)
+   __FORCE_INLINE void bind(Connections::In<T>&)
    {
-      chan.bind(c);
+      static_assert(sizeof(T) == 0, "ac_channel: Connections binding is not supported by this build");
    }
-   __FORCE_INLINE void bind(Connections::SyncIn& c)
+   __FORCE_INLINE void bind(Connections::SyncIn&)
    {
-      chan.bind(c);
+      static_assert(sizeof(T) == 0, "ac_channel: Connections binding is not supported by this build");
    }
-   __FORCE_INLINE void bind(Connections::SyncOut& c)
+   __FORCE_INLINE void bind(Connections::SyncOut&)
    {
-      chan.bind(c);
+      static_assert(sizeof(T) == 0, "ac_channel: Connections binding is not supported by this build");
    }
 #endif
 
  private:
-#if !defined(__BAMBU__) || defined(__BAMBU_SIM__)
+   /////////////////////////////////////////////////
+   // Software state
+   /////////////////////////////////////////////////
+
+   std::deque<T> ch; // the one fifo
+   unsigned int rSz; // reset size
+   T rVal;           // reset value
+   int size_call_count;
+
+   /////////////////////////////////////////////////
+   // Assertion support
+   /////////////////////////////////////////////////
+
 #ifndef AC_CHANNEL_ASSERT
-#define AC_CHANNEL_ASSERT(cond, code) ac_assert(cond, __FILE__, __LINE__, code)
+#define AC_CHANNEL_ASSERT(valid, code) ac_assert(valid, __FILE__, __LINE__, code)
    static inline void ac_assert(bool condition, const char* file, int line, const ac_channel_exception::code& code)
    {
 #ifndef AC_USER_DEFINED_ASSERT
@@ -293,12 +433,14 @@ class ac_channel
          throw(e);
 #endif
 #else
-         std::cerr << "Assert";
+         // fprintf, not std::cerr: <iostream> is not available in the synthesis build and its static
+         // initialiser has no business in the kernel translation unit.
+         std::fprintf(stderr, "Assert");
          if(e.file)
          {
-            std::cerr << " in file " << e.file << ":" << e.line;
+            std::fprintf(stderr, " in file %s:%u", e.file, e.line);
          }
-         std::cerr << " " << e.msg << std::endl;
+         std::fprintf(stderr, " %s\n", e.msg);
          assert(0);
 #endif
       }
@@ -309,891 +451,296 @@ class ac_channel
 #else
 #error "private use only - AC_CHANNEL_ASSERT macro already defined"
 #endif
-#else
-#define AC_CHANNEL_ASSERT(cond, code)
-#endif
 
- public:
-   class fifo
+   /////////////////////////////////////////////////
+   // Bambu ABI seam: declarations must keep these signatures
+   /////////////////////////////////////////////////
+
+   // InterfaceInfer identifies these member templates by mangled name and takes the payload width from
+   // their return type. Host-only definitions follow the class.
+
+   // Blocking read / peek.
+   template <class T0>
+   const T0 _read_bambu_internal();
+   template <class T0>
+   const T0 _peek_bambu_internal();
+
+   // Non-blocking read / peek with valid packed above the value bits.
+   template <class T0>
+   const T0 _read_bambu_internal(bool& valid);
+   template <class T0>
+   const T0 _peek_bambu_internal(bool& valid);
+
+   // Non-blocking read / peek with valid returned by reference for compilers without _BitInt.
+   template <class T0>
+   const T0 _read_bambu_internal(bool& valid, bool& dummy);
+   template <class T0>
+   const T0 _peek_bambu_internal(bool& valid, bool& dummy);
+
+   // Write.
+   template <class T0>
+   bool _write_bambu_internal(T0 value);
+
+   /////////////////////////////////////////////////
+   // Payload bit casting (Clang 16 and later)
+   /////////////////////////////////////////////////
+
+#if __clang_major__ >= 16
+   template <class T0, int W>
+   union bambu_bitcast_payload
    {
-      enum fifo_type
-      {
-         fifo_ac_channel_type,
-         fifo_sc_fifo_type,
-         fifo_connections_type,
-         fifo_connections_sync_type
-      };
+      unsigned _BitInt(W) bits;
+      T0 object;
 
-#if defined(__BAMBU__) && !defined(__BAMBU_SIM__)
-      template <class T0>
-      const T0 _read_bambu_internal(void);
-      template <class T0>
-      const T0 _read_bambu_internal(bool& res);
-      template <class T0>
-      const T0 _read_bambu_internal(bool& res, bool& dummy);
-      template <class T0>
-      const T0 _peek_bambu_internal(void);
-      template <class T0>
-      const T0 _peek_bambu_internal(bool& res);
-      template <class T0>
-      const T0 _peek_bambu_internal(bool& res, bool& dummy);
-      template <class T0>
-      bool _write_bambu_internal(T0 t);
-#else
-      struct fifo_abstract
+      __FORCE_INLINE bambu_bitcast_payload()
       {
-         virtual ~fifo_abstract() = default;
-         virtual fifo_type get_fifo_type() const = 0;
-         virtual T read() = 0;
-         virtual bool nb_read(T& t) = 0;
-         virtual T peek() = 0;
-         virtual bool nb_peek(T& t) = 0;
-         virtual void write(const T& t) = 0;
-         virtual bool nb_write(T& t) = 0;
-         virtual bool empty() = 0;
-         virtual bool available(unsigned int k) const = 0;
-         virtual unsigned int size() const = 0;
-         virtual unsigned int num_free() const = 0;
-         virtual void reset() = 0;
-         virtual const T& operator_sb(const unsigned int& pos, const T& default_value) const = 0;
-         virtual T& operator_sb(const unsigned int& pos, const T& default_value) = 0;
-      };
-
-      struct fifo_ac_channel : fifo_abstract
-      {
-         std::deque<T> ch;
-#ifdef AC_CHANNEL_PROFILING
-         unsigned max_size = 0;
-#endif
-
-         ~fifo_ac_channel()
-         {
-#ifdef AC_CHANNEL_PROFILING
-            if(!empty())
-            {
-               std::cerr << "channel not empty on exit " << __ASSERT_FUNCTION << std::endl;
-            }
-            std::cerr << "Channel maximum size: " << max_size << " " << __ASSERT_FUNCTION << std::endl;
-#endif
-         };
-
-         static inline fifo_type ftype()
-         {
-            return fifo_ac_channel_type;
-         }
-
-         fifo_type get_fifo_type() const
-         {
-            return ftype();
-         }
-
-         T read()
-         {
-            {
-               // If you hit this assert you attempted a read on an empty channel. Perhaps
-               // you need to guard the execution of the read with a call to the available()
-               // function:
-               //    if (myInputChan.available(2)) {
-               //      // it is safe to read two values
-               //      cout << myInputChan.read();
-               //      cout << myInputChan.read();
-               //    }
-               AC_CHANNEL_ASSERT(!empty(), ac_channel_exception::read_from_empty_channel);
-            }
-            T t = ch.front();
-            ch.pop_front();
-            return t;
-         }
-         bool nb_read(T& t)
-         {
-            return empty() ? false : (t = read(), true);
-         }
-         T peek()
-         {
-            AC_CHANNEL_ASSERT(!empty(), ac_channel_exception::read_from_empty_channel);
-            return ch.front();
-         }
-         bool nb_peek(T& t)
-         {
-            return empty() ? false : (t = peek(), true);
-         }
-
-         void write(const T& t)
-         {
-            AC_CHANNEL_ASSERT(num_free(), ac_channel_exception::write_to_full_channel);
-            ch.push_back(t);
-#ifdef AC_CHANNEL_PROFILING
-            max_size = std::max(max_size, size());
-#endif
-         }
-         bool nb_write(T& t)
-         {
-            return !num_free() ? false : (write(t), true);
-         }
-
-         bool empty()
-         {
-            return size() == 0;
-         }
-         bool available(unsigned int k) const
-         {
-            return size() >= k;
-         }
-         unsigned int size() const
-         {
-            return (int)ch.size();
-         }
-         unsigned int num_free() const
-         {
-            return ch.max_size() - ch.size();
-         }
-
-         void reset()
-         {
-            ch.clear();
-         }
-
-         const T& operator_sb(const unsigned int& pos, const T&) const
-         {
-            return ch[pos];
-         }
-
-         T& operator_sb(const unsigned int& pos, const T&)
-         {
-            return ch[pos];
-         }
-      };
-
-#ifdef SYSTEMC_INCLUDED
-      struct fifo_sc_fifo : fifo_abstract
-      {
-         sc_core::sc_fifo_in<T>* fifo_in;
-         sc_core::sc_fifo_out<T>* fifo_out;
-
-         ~fifo_sc_fifo()
-         {
-         }
-
-         static inline fifo_type ftype()
-         {
-            return fifo_sc_fifo_type;
-         }
-
-         fifo_type get_fifo_type() const
-         {
-            return ftype();
-         }
-
-         T read()
-         {
-            return fifo_in->read();
-         }
-         bool nb_read(T& t)
-         {
-            return empty() ? false : (t = read(), true);
-         }
-         T peek()
-         {
-            AC_CHANNEL_ASSERT(0, ac_channel_exception::no_peek_defined_for_channel_type);
-            return *static_cast<T*>(nullptr);
-         }
-         bool nb_peek(T&)
-         {
-            AC_CHANNEL_ASSERT(0, ac_channel_exception::no_peek_defined_for_channel_type);
-            return false;
-         }
-
-         void write(const T& t)
-         {
-            fifo_out->write(t);
-         }
-         bool nb_write(T& t)
-         {
-            return !num_free() ? false : (write(t), true);
-         }
-
-         bool empty()
-         {
-            return size() == 0;
-         }
-         bool available(unsigned int k) const
-         {
-            return size() >= k;
-         }
-         unsigned int size() const
-         {
-            return fifo_in->num_available();
-         }
-         unsigned int num_free() const
-         {
-            return fifo_out->num_free();
-         }
-
-         void reset()
-         {
-            AC_CHANNEL_ASSERT(empty(), ac_channel_exception::fifo_not_empty_when_reset);
-         }
-
-         const T& operator_sb(const unsigned int&, const T& default_value) const
-         {
-            AC_CHANNEL_ASSERT(0, ac_channel_exception::no_operator_sb_defined_for_channel_type);
-            return default_value;
-         }
-      };
-
-    public:
-      void bind(sc_core::sc_fifo_in<T>& f)
-      {
-         get_fifo<fifo_sc_fifo>().fifo_in = &f;
       }
-      void bind(sc_core::sc_fifo_out<T>& f)
-      {
-         get_fifo<fifo_sc_fifo>().fifo_out = &f;
-      }
-
-    private:
-#endif
-
-#ifdef __CONNECTIONS__CONNECTIONS_H__
-      struct fifo_connections : fifo_abstract
-      {
-         Connections::In<T>* fifo_in;
-         Connections::Out<T>* fifo_out;
-
-         ~fifo_connections()
-         {
-         }
-         static inline fifo_type ftype()
-         {
-            return fifo_connections_type;
-         }
-         fifo_type get_fifo_type() const
-         {
-            return ftype();
-         }
-
-         T read()
-         {
-            return fifo_in->Pop();
-         }
-         bool nb_read(T& t)
-         {
-            return fifo_in->PopNB(t);
-         }
-         T peek()
-         {
-            AC_CHANNEL_ASSERT(0, ac_channel_exception::no_peek_defined_for_channel_type);
-            return *static_cast<T*>(nullptr);
-         }
-         bool nb_peek(T&)
-         {
-            AC_CHANNEL_ASSERT(0, ac_channel_exception::no_peek_defined_for_channel_type);
-            return false;
-         }
-
-         void write(const T& t)
-         {
-            fifo_out->Push(t);
-         }
-         bool nb_write(T& t)
-         {
-            return fifo_out->PushNB(t);
-         }
-
-         bool empty()
-         {
-            if(fifo_in)
-               return fifo_in->Empty();
-            else
-               AC_CHANNEL_ASSERT(0, ac_channel_exception::no_output_empty_in_connections);
-            return false;
-         }
-         bool available(unsigned int k) const
-         {
-            return true;
-         }
-         unsigned int size() const
-         {
-            AC_CHANNEL_ASSERT(0, ac_channel_exception::no_size_in_connections);
-            return 0;
-         }
-         unsigned int num_free() const
-         {
-            AC_CHANNEL_ASSERT(0, ac_channel_exception::no_num_free_in_connections);
-            return 0;
-         }
-
-         void reset()
-         {
-            AC_CHANNEL_ASSERT(empty(), ac_channel_exception::fifo_not_empty_when_reset);
-         }
-
-         const T& operator_sb(const unsigned int&, const T& default_value) const
-         {
-            AC_CHANNEL_ASSERT(0, ac_channel_exception::no_operator_sb_defined_for_channel_type);
-            return default_value;
-         }
-      };
-
-      struct fifo_connections_sync : fifo_abstract
-      {
-         Connections::SyncIn* sync_in;
-         Connections::SyncOut* sync_out;
-
-         ~fifo_connections_sync()
-         {
-         }
-         static inline fifo_type ftype()
-         {
-            return fifo_connections_sync_type;
-         }
-         fifo_type get_fifo_type() const
-         {
-            return ftype();
-         }
-
-         bool read()
-         {
-            sync_in->sync_in();
-            return true;
-         }
-         bool nb_read(T& t)
-         {
-            t = true;
-            return (sync_in->nb_sync_in());
-         }
-         T peek()
-         {
-            AC_CHANNEL_ASSERT(0, ac_channel_exception::no_peek_defined_for_channel_type);
-            return *static_cast<T*>(nullptr);
-         }
-         bool nb_peek(T&)
-         {
-            AC_CHANNEL_ASSERT(0, ac_channel_exception::no_peek_defined_for_channel_type);
-            return false;
-         }
-
-         void write(const T& t)
-         {
-            sync_out->sync_out();
-         }
-         bool nb_write(T& t)
-         {
-            sync_out->sync_out();
-            return true;
-         }
-
-         bool empty()
-         {
-            AC_CHANNEL_ASSERT(0, ac_channel_exception::no_output_empty_in_connections);
-            return (false);
-         }
-         bool available(unsigned int k) const
-         {
-            return true;
-         }
-         unsigned int size() const
-         {
-            AC_CHANNEL_ASSERT(0, ac_channel_exception::no_size_in_connections);
-            return 0;
-         }
-         unsigned int num_free() const
-         {
-            AC_CHANNEL_ASSERT(0, ac_channel_exception::no_num_free_in_connections);
-            return 0;
-         }
-         void reset()
-         {
-            if(sync_in)
-               sync_in->reset_sync_in();
-            if(sync_out)
-               sync_out->reset_sync_out();
-         }
-         const T& operator_sb(const unsigned int&, const T& default_value) const
-         {
-            AC_CHANNEL_ASSERT(0, ac_channel_exception::no_operator_sb_defined_for_channel_type);
-            return default_value;
-         }
-      };
-
-    public:
-      void bind(Connections::In<T>& c)
-      {
-         get_fifo<fifo_connections>().fifo_in = &c;
-      }
-      void bind(Connections::Out<T>& c)
-      {
-         get_fifo<fifo_connections>().fifo_out = &c;
-      }
-
-      void bind(Connections::SyncIn& c)
-      {
-         get_fifo<fifo_connections_sync>().sync_in = &c;
-      }
-      void bind(Connections::SyncOut& c)
-      {
-         get_fifo<fifo_connections_sync>().sync_out = &c;
-      }
-
-    private:
-#endif
-
-      template <typename fifo_T, typename... Args>
-      fifo_T& get_fifo()
-      {
-         if(!f || f->get_fifo_type() != fifo_T::ftype())
-         {
-            if(f)
-            {
-               AC_CHANNEL_ASSERT(f->empty(), ac_channel_exception::fifo_not_empty_when_reset);
-               delete f;
-            }
-            f = new fifo_T;
-         }
-         return static_cast<fifo_T&>(*f);
-      }
-
-      fifo_abstract* f;
-      unsigned int rSz; // reset size
-      T rVal;           // resetValue
-      int size_call_count;
-#endif
-#if defined(__BAMBU__) && !defined(__BAMBU_SIM__)
-#if __clang_major__ >= 16
-      template <class T0, int W>
-      union bambu_bitcast_payload
-      {
-         unsigned _BitInt(W) bits;
-         T0 object;
-
-         __FORCE_INLINE bambu_bitcast_payload()
-         {
-         }
-      };
-
-      template <class T0, std::enable_if_t<std::is_same<T, T0>::value, bool> = true>
-      __FORCE_INLINE void _read0(T0& t)
-      {
-         enum
-         {
-            _BitWidth0 = 8 * sizeof(T0)
-         };
-         bambu_bitcast_payload<T0, _BitWidth0> payload;
-         payload.bits = _read_bambu_internal<unsigned _BitInt(_BitWidth0)>();
-         t = payload.object;
-      }
-#else
-      template <class T0, std::enable_if_t<std::is_same<T, T0>::value, bool> = true>
-      __FORCE_INLINE void _read0(T0& t)
-      {
-         t = _read_bambu_internal<T0>();
-      }
-#endif
-#if __clang_major__ >= 16
-      template <class T0, std::enable_if_t<std::is_same<T, T0>::value, bool> = true>
-      __FORCE_INLINE void _read0(T0& t, bool& cond)
-      {
-         enum
-         {
-            _BitWidth0 = 8 * sizeof(T0)
-         };
-         bool cond0;
-         unsigned _BitInt(_BitWidth0 + 1) res = _read_bambu_internal<unsigned _BitInt(_BitWidth0 + 1)>(cond0);
-         unsigned char cond1 = (res >> ((unsigned _BitInt(_BitWidth0 + 1)) _BitWidth0)) & 1;
-         cond = cond1;
-         bambu_bitcast_payload<T0, _BitWidth0> payload;
-         payload.bits = res;
-         t = payload.object;
-      }
-#else
-      template <class T0, std::enable_if_t<std::is_same<T, T0>::value, bool> = true>
-      __FORCE_INLINE void _read0(T0& t, bool& cond)
-      {
-         bool dummy;
-         t = _read_bambu_internal<T0>(cond, dummy);
-      }
-#endif
-#if __clang_major__ >= 16
-      template <class T0, std::enable_if_t<std::is_same<T, T0>::value, bool> = true>
-      __FORCE_INLINE void _peek0(T0& t)
-      {
-         enum
-         {
-            _BitWidth0 = 8 * sizeof(T0)
-         };
-         bambu_bitcast_payload<T0, _BitWidth0> payload;
-         payload.bits = _peek_bambu_internal<unsigned _BitInt(_BitWidth0)>();
-         t = payload.object;
-      }
-#else
-      template <class T0, std::enable_if_t<std::is_same<T, T0>::value, bool> = true>
-      __FORCE_INLINE void _peek0(T0& t)
-      {
-         t = _peek_bambu_internal<T0>();
-      }
-#endif
-#if __clang_major__ >= 16
-      template <class T0, std::enable_if_t<std::is_same<T, T0>::value, bool> = true>
-      __FORCE_INLINE void _peek0(T0& t, bool& cond)
-      {
-         enum
-         {
-            _BitWidth0 = 8 * sizeof(T0)
-         };
-         bool cond0;
-         unsigned _BitInt(_BitWidth0 + 1) res = _peek_bambu_internal<unsigned _BitInt(_BitWidth0 + 1)>(cond0);
-         unsigned char cond1 = (res >> ((unsigned _BitInt(_BitWidth0 + 1)) _BitWidth0)) & 1;
-         cond = cond1;
-         bambu_bitcast_payload<T0, _BitWidth0> payload;
-         payload.bits = res;
-         t = payload.object;
-      }
-#else
-      template <class T0, std::enable_if_t<std::is_same<T, T0>::value, bool> = true>
-      __FORCE_INLINE void _peek0(T0& t, bool& cond)
-      {
-         bool dummy;
-         t = _peek_bambu_internal<T0>(cond, dummy);
-      }
-#endif
-#if __clang_major__ >= 16
-      template <int W, bool S, std::enable_if_t<std::is_same<T, ac_int<W, S>>::value, bool> = true>
-      __FORCE_INLINE void _read0(ac_int<W, S>& t)
-      {
-         unsigned _BitInt(W) res = _read_bambu_internal<unsigned _BitInt(W)>();
-         t.from_BitInt(res);
-      }
-      template <int W, int I, bool S = true, ac_q_mode Q = AC_TRN, ac_o_mode O = AC_WRAP,
-                std::enable_if_t<std::is_same<T, ac_fixed<W, I, S, Q, O>>::value, bool> = true>
-      __FORCE_INLINE void _read0(ac_fixed<W, I, S, Q, O>& t)
-      {
-         unsigned _BitInt(W) res = _read_bambu_internal<unsigned _BitInt(W)>();
-         t.from_BitInt(res);
-      }
-      template <int W, bool S, std::enable_if_t<std::is_same<T, ac_int<W, S>>::value, bool> = true>
-      __FORCE_INLINE void _read0(ac_int<W, S>& t, bool& cond)
-      {
-         bool cond0;
-         unsigned _BitInt(W + 1) res = _read_bambu_internal<unsigned _BitInt(W + 1)>(cond0);
-         cond = (res >> ((unsigned _BitInt(W + 1)) W)) & 1;
-         unsigned _BitInt(W) val = res;
-         t.from_BitInt(val);
-      }
-      template <int W, int I, bool S = true, ac_q_mode Q = AC_TRN, ac_o_mode O = AC_WRAP,
-                std::enable_if_t<std::is_same<T, ac_fixed<W, I, S, Q, O>>::value, bool> = true>
-      __FORCE_INLINE void _read0(ac_fixed<W, I, S, Q, O>& t, bool& cond)
-      {
-         bool cond0;
-         unsigned _BitInt(W + 1) res = _read_bambu_internal<unsigned _BitInt(W + 1)>(cond0);
-         cond = (res >> ((unsigned _BitInt(W + 1)) W)) & 1;
-         unsigned _BitInt(W) val = res;
-         t.from_BitInt(val);
-      }
-      template <int W, bool S, std::enable_if_t<std::is_same<T, ac_int<W, S>>::value, bool> = true>
-      __FORCE_INLINE void _peek0(ac_int<W, S>& t)
-      {
-         unsigned _BitInt(W) res = _peek_bambu_internal<unsigned _BitInt(W)>();
-         t.from_BitInt(res);
-      }
-      template <int W, int I, bool S = true, ac_q_mode Q = AC_TRN, ac_o_mode O = AC_WRAP,
-                std::enable_if_t<std::is_same<T, ac_fixed<W, I, S, Q, O>>::value, bool> = true>
-      __FORCE_INLINE void _peek0(ac_fixed<W, I, S, Q, O>& t)
-      {
-         unsigned _BitInt(W) res = _peek_bambu_internal<unsigned _BitInt(W)>();
-         t.from_BitInt(res);
-      }
-      template <int W, bool S, std::enable_if_t<std::is_same<T, ac_int<W, S>>::value, bool> = true>
-      __FORCE_INLINE void _peek0(ac_int<W, S>& t, bool& cond)
-      {
-         bool cond0;
-         unsigned _BitInt(W + 1) res = _peek_bambu_internal<unsigned _BitInt(W + 1)>(cond0);
-         cond = (res >> ((unsigned _BitInt(W + 1)) W)) & 1;
-         unsigned _BitInt(W) val = res;
-         t.from_BitInt(val);
-      }
-      template <int W, int I, bool S = true, ac_q_mode Q = AC_TRN, ac_o_mode O = AC_WRAP,
-                std::enable_if_t<std::is_same<T, ac_fixed<W, I, S, Q, O>>::value, bool> = true>
-      __FORCE_INLINE void _peek0(ac_fixed<W, I, S, Q, O>& t, bool& cond)
-      {
-         bool cond0;
-         unsigned _BitInt(W + 1) res = _peek_bambu_internal<unsigned _BitInt(W + 1)>(cond0);
-         cond = (res >> ((unsigned _BitInt(W + 1)) W)) & 1;
-         unsigned _BitInt(W) val = res;
-         t.from_BitInt(val);
-      }
-#endif
-
-#endif
-    public:
-#if defined(__BAMBU__) && !defined(__BAMBU_SIM__)
-
-      ///// read
-      __FORCE_INLINE T read()
-      {
-         T val;
-         _read0(val);
-         return val;
-      }
-
-      ///// read
-      __FORCE_INLINE bool nb_read(T& t)
-      {
-         bool res;
-         T temp;
-         _read0(temp, res);
-         t = res ? temp : t;
-         return res;
-      }
-
-      ///// peek
-      __FORCE_INLINE T peek()
-      {
-         T val;
-         _peek0(val);
-         return val;
-      }
-
-      ///// nb_peek
-      __FORCE_INLINE bool nb_peek(T& t)
-      {
-         bool res;
-         T temp;
-         _peek0(temp, res);
-         t = res ? temp : t;
-         return res;
-      }
-
-      ///// write
-#if __clang_major__ >= 16
-      template <class T0, std::enable_if_t<std::is_same<T, T0>::value, bool> = true>
-      __FORCE_INLINE void write(const T0& t)
-      {
-         enum
-         {
-            _BitWidth0 = 8 * sizeof(t)
-         };
-         bambu_bitcast_payload<T0, _BitWidth0> payload;
-         payload.object = t;
-         _write_bambu_internal(payload.bits);
-      }
-#else
-      template <class T0, std::enable_if_t<std::is_same<T, T0>::value, bool> = true>
-      __FORCE_INLINE void write(const T0& t)
-      {
-         _write_bambu_internal(t);
-      }
-#endif
-#if __clang_major__ >= 16
-      template <int W, bool S, std::enable_if_t<std::is_same<T, ac_int<W, S>>::value, bool> = true>
-      __FORCE_INLINE void write(const ac_int<W, S>& t)
-      {
-         _write_bambu_internal(t.to_BitInt());
-      }
-      template <int W, int I, bool S = true, ac_q_mode Q = AC_TRN, ac_o_mode O = AC_WRAP,
-                std::enable_if_t<std::is_same<T, ac_fixed<W, I, S, Q, O>>::value, bool> = true>
-      __FORCE_INLINE void write(const ac_fixed<W, I, S, Q, O>& t)
-      {
-         _write_bambu_internal(t.to_BitInt());
-      }
-#endif
-
-      ///// nb_write
-#if __clang_major__ >= 16
-      template <class T0, std::enable_if_t<std::is_same<T, T0>::value, bool> = true>
-      __FORCE_INLINE bool nb_write(const T0& t)
-      {
-         enum
-         {
-            _BitWidth0 = 8 * sizeof(t)
-         };
-         bambu_bitcast_payload<T0, _BitWidth0> payload;
-         payload.object = t;
-         return _write_bambu_internal(payload.bits);
-      }
-#else
-      template <class T0, std::enable_if_t<std::is_same<T, T0>::value, bool> = true>
-      __FORCE_INLINE bool nb_write(const T0& t)
-      {
-         return _write_bambu_internal(t);
-      }
-#endif
-#if __clang_major__ >= 16
-      template <int W, bool S, std::enable_if_t<std::is_same<T, ac_int<W, S>>::value, bool> = true>
-      __FORCE_INLINE bool nb_write(const ac_int<W, S>& t)
-      {
-         return _write_bambu_internal(t.to_BitInt());
-      }
-      template <int W, int I, bool S = true, ac_q_mode Q = AC_TRN, ac_o_mode O = AC_WRAP,
-                std::enable_if_t<std::is_same<T, ac_fixed<W, I, S, Q, O>>::value, bool> = true>
-      __FORCE_INLINE bool nb_write(const ac_fixed<W, I, S, Q, O>& t)
-      {
-         return _write_bambu_internal(t.to_BitInt());
-      }
-#endif
-#else
-      fifo() : f(0), rSz(0), size_call_count(0)
-      {
-         get_fifo<fifo_ac_channel>();
-      }
-      fifo(int init) : f(0), rSz(init), size_call_count(0)
-      {
-         get_fifo<fifo_ac_channel>();
-      }
-      fifo(int init, T val) : f(0), rSz(init), rVal(val), size_call_count(0)
-      {
-         get_fifo<fifo_ac_channel>();
-      }
-      fifo(const fifo& other)
-      {
-         if(!other.f || other.f->get_fifo_type() != fifo_ac_channel::ftype())
-         {
-            get_fifo<fifo_ac_channel>();
-         }
-         else
-         {
-            f = new fifo_ac_channel(*static_cast<fifo_ac_channel*>(other.f));
-         }
-      }
-      ~fifo()
-      {
-         delete f;
-      }
-
-      inline T read()
-      {
-         return f->read();
-      }
-      inline bool nb_read(T& t)
-      {
-         return f->nb_read(t);
-      }
-      inline T peek()
-      {
-         return f->peek();
-      }
-      inline bool nb_peek(T& t)
-      {
-         return f->nb_peek(t);
-      }
-
-      inline void write(const T& t)
-      {
-         f->write(t);
-      }
-      inline bool nb_write(T& t)
-      {
-         return f->nb_write(t);
-      }
-
-      inline bool empty()
-      {
-         return f->empty();
-      }
-      inline bool available(unsigned int k) const
-      {
-         return f->available(k);
-      }
-      inline unsigned int size() const
-      {
-         return f->size();
-      }
-      inline unsigned int num_free() const
-      {
-         return f->num_free();
-      }
-
-      inline void reset()
-      {
-         f->reset();
-         for(int i = 0; i < (int)rSz; i++)
-         {
-            write(rVal);
-         }
-      }
-
-      inline const T& operator[](unsigned int pos) const
-      {
-         return f->operator_sb(pos, rVal);
-      }
-
-      inline T& operator[](unsigned int pos)
-      {
-         return f->operator_sb(pos, rVal);
-      }
-
-      void incr_size_call_count()
-      {
-         ++size_call_count;
-      }
-      int get_size_call_count()
-      {
-         int tmp = size_call_count;
-         size_call_count = 0;
-         return tmp;
-      }
-
-      // obsolete - provided here for backward compatibility with ac_channel
-      struct iterator
-      {
-         iterator operator+(unsigned int pos_) const
-         {
-            return iterator(itr, pos_);
-         }
-
-       private:
-         friend class fifo;
-         iterator(const typename std::deque<T>::iterator& itr_, unsigned int pos = 0) : itr(itr_)
-         {
-            if(pos)
-            {
-               itr += pos;
-            }
-         }
-         typename std::deque<T>::iterator itr;
-      };
-      iterator begin()
-      {
-         AC_CHANNEL_ASSERT(f->get_fifo_type() == fifo_ac_channel_type,
-                           ac_channel_exception::no_insert_defined_for_channel_type);
-         return iterator(get_fifo<fifo_ac_channel>().ch.begin());
-      }
-      void insert(iterator itr, const T& t)
-      {
-         AC_CHANNEL_ASSERT(f->get_fifo_type() == fifo_ac_channel_type,
-                           ac_channel_exception::no_insert_defined_for_channel_type);
-         get_fifo<fifo_ac_channel>().ch.insert(itr.itr, t);
-      }
-#endif
    };
-   fifo chan;
+#endif
 
- private:
-#if defined(__BAMBU__) && !defined(__BAMBU_SIM__)
-   // Prevent the compiler from autogenerating these.
-   //  (This enforces that channels are always passed by reference.)
-   ac_channel(const ac_channel<T>&) = delete;
-   ac_channel& operator=(const ac_channel<T>&) = delete;
+   /////////////////////////////////////////////////
+   // Conversion between channel values and ABI payloads
+   /////////////////////////////////////////////////
+
+   // Plain blocking values travel as T. ac_int/ac_fixed use their logical bit width; plain non-blocking
+   // values are bit-cast so the valid flag can share the payload. Measurements and padding considerations
+   // are documented in documentation/ac_channel_abi.md.
+   template <class T0, std::enable_if_t<std::is_same<T0, T>::value, bool> = true>
+   static __FORCE_INLINE T0 _to_payload(const T& value)
+   {
+      return value;
+   }
+   template <class T0, std::enable_if_t<std::is_same<T0, T>::value, bool> = true>
+   static __FORCE_INLINE void _from_payload(T& value, const T0& bits)
+   {
+      value = bits;
+   }
+
+#if __clang_major__ >= 16
+   template <class T0, std::enable_if_t<!std::is_same<T0, T>::value && !ac_channel_is_ac<T>::value, bool> = true>
+   static __FORCE_INLINE T0 _to_payload(const T& value)
+   {
+      bambu_bitcast_payload<T, ac_channel_packed<T>::bits> payload;
+      payload.bits = 0;
+      payload.object = value;
+      return static_cast<T0>(payload.bits);
+   }
+   template <class T0, std::enable_if_t<!std::is_same<T0, T>::value && !ac_channel_is_ac<T>::value, bool> = true>
+   static __FORCE_INLINE void _from_payload(T& value, const T0& bits)
+   {
+      bambu_bitcast_payload<T, ac_channel_packed<T>::bits> payload;
+      payload.bits = static_cast<unsigned _BitInt(ac_channel_packed<T>::bits)>(bits);
+      value = payload.object;
+   }
+
+   template <class T0, std::enable_if_t<ac_channel_is_ac<T>::value && !std::is_same<T0, T>::value, bool> = true>
+   static __FORCE_INLINE T0 _to_payload(const T& value)
+   {
+      return static_cast<T0>(value.to_BitInt());
+   }
+   template <class T0, std::enable_if_t<ac_channel_is_ac<T>::value && !std::is_same<T0, T>::value, bool> = true>
+   static __FORCE_INLINE void _from_payload(T& value, const T0& bits)
+   {
+      unsigned _BitInt(ac_channel_packed<T>::bits) value_bits =
+          static_cast<unsigned _BitInt(ac_channel_packed<T>::bits)>(bits);
+      value.from_BitInt(value_bits);
+   }
+#endif
+
+   /////////////////////////////////////////////////
+   // Payload adapters: blocking read / peek / write
+   /////////////////////////////////////////////////
+
+   // A plain type travels as itself, so there is nothing to convert here.
+   template <class T0, std::enable_if_t<std::is_same<T, T0>::value, bool> = true>
+   __FORCE_INLINE void _read0(T0& value)
+   {
+      value = _read_bambu_internal<T0>();
+   }
+   template <class T0, std::enable_if_t<std::is_same<T, T0>::value, bool> = true>
+   __FORCE_INLINE void _peek0(T0& value)
+   {
+      value = _peek_bambu_internal<T0>();
+   }
+   template <class T0, std::enable_if_t<std::is_same<T, T0>::value, bool> = true>
+   __FORCE_INLINE void _write0(const T0& value)
+   {
+      _write_bambu_internal(value);
+   }
+   template <class T0, std::enable_if_t<std::is_same<T, T0>::value, bool> = true>
+   __FORCE_INLINE bool _nb_write0(const T0& value)
+   {
+      return _write_bambu_internal(value);
+   }
+
+#if __clang_major__ >= 16
+   template <int W, bool S, std::enable_if_t<std::is_same<T, ac_int<W, S>>::value, bool> = true>
+   __FORCE_INLINE void _read0(ac_int<W, S>& value)
+   {
+      unsigned _BitInt(W) packed_value = _read_bambu_internal<unsigned _BitInt(W)>();
+      value.from_BitInt(packed_value);
+   }
+   template <int W, int I, bool S = true, ac_q_mode Q = AC_TRN, ac_o_mode O = AC_WRAP,
+             std::enable_if_t<std::is_same<T, ac_fixed<W, I, S, Q, O>>::value, bool> = true>
+   __FORCE_INLINE void _read0(ac_fixed<W, I, S, Q, O>& value)
+   {
+      unsigned _BitInt(W) packed_value = _read_bambu_internal<unsigned _BitInt(W)>();
+      value.from_BitInt(packed_value);
+   }
+   template <int W, bool S, std::enable_if_t<std::is_same<T, ac_int<W, S>>::value, bool> = true>
+   __FORCE_INLINE void _peek0(ac_int<W, S>& value)
+   {
+      unsigned _BitInt(W) packed_value = _peek_bambu_internal<unsigned _BitInt(W)>();
+      value.from_BitInt(packed_value);
+   }
+   template <int W, int I, bool S = true, ac_q_mode Q = AC_TRN, ac_o_mode O = AC_WRAP,
+             std::enable_if_t<std::is_same<T, ac_fixed<W, I, S, Q, O>>::value, bool> = true>
+   __FORCE_INLINE void _peek0(ac_fixed<W, I, S, Q, O>& value)
+   {
+      unsigned _BitInt(W) packed_value = _peek_bambu_internal<unsigned _BitInt(W)>();
+      value.from_BitInt(packed_value);
+   }
+   template <int W, bool S, std::enable_if_t<std::is_same<T, ac_int<W, S>>::value, bool> = true>
+   __FORCE_INLINE void _write0(const ac_int<W, S>& value)
+   {
+      _write_bambu_internal(value.to_BitInt());
+   }
+   template <int W, int I, bool S = true, ac_q_mode Q = AC_TRN, ac_o_mode O = AC_WRAP,
+             std::enable_if_t<std::is_same<T, ac_fixed<W, I, S, Q, O>>::value, bool> = true>
+   __FORCE_INLINE void _write0(const ac_fixed<W, I, S, Q, O>& value)
+   {
+      _write_bambu_internal(value.to_BitInt());
+   }
+   template <int W, bool S, std::enable_if_t<std::is_same<T, ac_int<W, S>>::value, bool> = true>
+   __FORCE_INLINE bool _nb_write0(const ac_int<W, S>& value)
+   {
+      return _write_bambu_internal(value.to_BitInt());
+   }
+   template <int W, int I, bool S = true, ac_q_mode Q = AC_TRN, ac_o_mode O = AC_WRAP,
+             std::enable_if_t<std::is_same<T, ac_fixed<W, I, S, Q, O>>::value, bool> = true>
+   __FORCE_INLINE bool _nb_write0(const ac_fixed<W, I, S, Q, O>& value)
+   {
+      return _write_bambu_internal(value.to_BitInt());
+   }
+#endif
+
+   /////////////////////////////////////////////////
+   // Payload adapters: non-blocking read / peek
+   /////////////////////////////////////////////////
+
+   // The payload asks for one bit more than the data: bits [0, N) carry the value and bit N the valid
+   // flag, so the whole answer arrives in one word.
+#if __clang_major__ >= 16
+   template <class T0, std::enable_if_t<std::is_same<T, T0>::value, bool> = true>
+   __FORCE_INLINE void _read0(T0& value, bool& valid)
+   {
+      enum
+      {
+         _BitWidth0 = 8 * sizeof(T0)
+      };
+      bool ignored_valid;
+      unsigned _BitInt(_BitWidth0 + 1) packed_value =
+          _read_bambu_internal<unsigned _BitInt(_BitWidth0 + 1)>(ignored_valid);
+      unsigned char valid_bit = (packed_value >> ((unsigned _BitInt(_BitWidth0 + 1)) _BitWidth0)) & 1;
+      valid = valid_bit;
+      bambu_bitcast_payload<T0, _BitWidth0> payload;
+      payload.bits = packed_value;
+      value = payload.object;
+   }
+   template <class T0, std::enable_if_t<std::is_same<T, T0>::value, bool> = true>
+   __FORCE_INLINE void _peek0(T0& value, bool& valid)
+   {
+      enum
+      {
+         _BitWidth0 = 8 * sizeof(T0)
+      };
+      bool ignored_valid;
+      unsigned _BitInt(_BitWidth0 + 1) packed_value =
+          _peek_bambu_internal<unsigned _BitInt(_BitWidth0 + 1)>(ignored_valid);
+      unsigned char valid_bit = (packed_value >> ((unsigned _BitInt(_BitWidth0 + 1)) _BitWidth0)) & 1;
+      valid = valid_bit;
+      bambu_bitcast_payload<T0, _BitWidth0> payload;
+      payload.bits = packed_value;
+      value = payload.object;
+   }
+
+   template <int W, bool S, std::enable_if_t<std::is_same<T, ac_int<W, S>>::value, bool> = true>
+   __FORCE_INLINE void _read0(ac_int<W, S>& value, bool& valid)
+   {
+      bool ignored_valid;
+      unsigned _BitInt(W + 1) packed_value = _read_bambu_internal<unsigned _BitInt(W + 1)>(ignored_valid);
+      valid = (packed_value >> ((unsigned _BitInt(W + 1)) W)) & 1;
+      unsigned _BitInt(W) value_bits = packed_value;
+      value.from_BitInt(value_bits);
+   }
+   template <int W, int I, bool S = true, ac_q_mode Q = AC_TRN, ac_o_mode O = AC_WRAP,
+             std::enable_if_t<std::is_same<T, ac_fixed<W, I, S, Q, O>>::value, bool> = true>
+   __FORCE_INLINE void _read0(ac_fixed<W, I, S, Q, O>& value, bool& valid)
+   {
+      bool ignored_valid;
+      unsigned _BitInt(W + 1) packed_value = _read_bambu_internal<unsigned _BitInt(W + 1)>(ignored_valid);
+      valid = (packed_value >> ((unsigned _BitInt(W + 1)) W)) & 1;
+      unsigned _BitInt(W) value_bits = packed_value;
+      value.from_BitInt(value_bits);
+   }
+   template <int W, bool S, std::enable_if_t<std::is_same<T, ac_int<W, S>>::value, bool> = true>
+   __FORCE_INLINE void _peek0(ac_int<W, S>& value, bool& valid)
+   {
+      bool ignored_valid;
+      unsigned _BitInt(W + 1) packed_value = _peek_bambu_internal<unsigned _BitInt(W + 1)>(ignored_valid);
+      valid = (packed_value >> ((unsigned _BitInt(W + 1)) W)) & 1;
+      unsigned _BitInt(W) value_bits = packed_value;
+      value.from_BitInt(value_bits);
+   }
+   template <int W, int I, bool S = true, ac_q_mode Q = AC_TRN, ac_o_mode O = AC_WRAP,
+             std::enable_if_t<std::is_same<T, ac_fixed<W, I, S, Q, O>>::value, bool> = true>
+   __FORCE_INLINE void _peek0(ac_fixed<W, I, S, Q, O>& value, bool& valid)
+   {
+      bool ignored_valid;
+      unsigned _BitInt(W + 1) packed_value = _peek_bambu_internal<unsigned _BitInt(W + 1)>(ignored_valid);
+      valid = (packed_value >> ((unsigned _BitInt(W + 1)) W)) & 1;
+      unsigned _BitInt(W) value_bits = packed_value;
+      value.from_BitInt(value_bits);
+   }
+#else
+   // Without _BitInt the valid flag cannot ride in the payload, so it comes back by reference.
+   template <class T0, std::enable_if_t<std::is_same<T, T0>::value, bool> = true>
+   __FORCE_INLINE void _read0(T0& value, bool& valid)
+   {
+      bool dummy;
+      value = _read_bambu_internal<T0>(valid, dummy);
+   }
+   template <class T0, std::enable_if_t<std::is_same<T, T0>::value, bool> = true>
+   __FORCE_INLINE void _peek0(T0& value, bool& valid)
+   {
+      bool dummy;
+      value = _peek_bambu_internal<T0>(valid, dummy);
+   }
 #endif
 };
 
+/////////////////////////////////////////////////
+// Constructor definitions
+/////////////////////////////////////////////////
+
 template <class T>
-ac_channel<T>::ac_channel() : chan()
+ac_channel<T>::ac_channel() : rSz(0), size_call_count(0)
 {
 }
 
-#if !defined(__BAMBU__) || defined(__BAMBU_SIM__)
 template <class T>
-ac_channel<T>::ac_channel(int init) : chan(init)
+ac_channel<T>::ac_channel(int init) : rSz(static_cast<unsigned int>(init)), size_call_count(0)
 {
+   T dc;
+   rVal = dc;
    for(int i = init; i > 0; i--)
    {
-      T dc;
       write(dc);
    }
 }
 
 template <class T>
-ac_channel<T>::ac_channel(int init, T val) : chan(init, val)
+ac_channel<T>::ac_channel(int init, T val) : rSz(static_cast<unsigned int>(init)), rVal(val), size_call_count(0)
 {
    for(int i = init; i > 0; i--)
    {
@@ -1202,7 +749,8 @@ ac_channel<T>::ac_channel(int init, T val) : chan(init, val)
 }
 
 template <class T>
-ac_channel<T>::ac_channel(std::initializer_list<T> val) : chan(val.size())
+ac_channel<T>::ac_channel(std::initializer_list<T> val)
+    : rSz(static_cast<unsigned int>(val.size())), size_call_count(0)
 {
    for(auto& v : val)
    {
@@ -1212,7 +760,9 @@ ac_channel<T>::ac_channel(std::initializer_list<T> val) : chan(val.size())
 
 template <class T>
 ac_channel<T>::ac_channel(const char* bin_file)
-    : chan(std::ifstream(bin_file, std::ifstream::ate | std::ifstream::binary).tellg() / sizeof(T))
+    : rSz(static_cast<unsigned int>(std::ifstream(bin_file, std::ifstream::ate | std::ifstream::binary).tellg() /
+                                    sizeof(T))),
+      size_call_count(0)
 {
    std::ifstream init_file(bin_file, std::ifstream::in | std::ifstream::binary);
    T v;
@@ -1221,6 +771,125 @@ ac_channel<T>::ac_channel(const char* bin_file)
       write(v);
    }
 }
+
+/////////////////////////////////////////////////
+// Definitions of the Bambu ABI seam
+/////////////////////////////////////////////////
+
+/////////////////////////////////////////////////
+// Blocking read / peek
+/////////////////////////////////////////////////
+
+template <class T>
+template <class T0>
+__attribute__((noinline)) const T0 ac_channel<T>::_read_bambu_internal()
+{
+   // If you hit this assert you attempted a read on an empty channel. Perhaps you need to guard the
+   // execution of the read with a call to the available() function:
+   //    if (myInputChan.available(2)) {
+   //      // it is safe to read two values
+   //      cout << myInputChan.read();
+   //      cout << myInputChan.read();
+   //    }
+   AC_CHANNEL_ASSERT(!ch.empty(), ac_channel_exception::read_from_empty_channel);
+   const T0 v = _to_payload<T0>(ch.front());
+   ch.pop_front();
+   return v;
+}
+
+template <class T>
+template <class T0>
+__attribute__((noinline)) const T0 ac_channel<T>::_peek_bambu_internal()
+{
+   AC_CHANNEL_ASSERT(!ch.empty(), ac_channel_exception::read_from_empty_channel);
+   return _to_payload<T0>(ch.front());
+}
+
+/////////////////////////////////////////////////
+// Non-blocking read / peek: packed valid bit
+/////////////////////////////////////////////////
+
+template <class T>
+template <class T0>
+__attribute__((noinline)) const T0 ac_channel<T>::_read_bambu_internal(bool& valid)
+{
+   valid = !ch.empty();
+   if(!valid)
+   {
+      return static_cast<T0>(0);
+   }
+   const T0 v = _to_payload<T0>(ch.front());
+   ch.pop_front();
+   return static_cast<T0>(v | (static_cast<T0>(1) << static_cast<T0>(ac_channel_packed<T>::bits)));
+}
+
+template <class T>
+template <class T0>
+__attribute__((noinline)) const T0 ac_channel<T>::_peek_bambu_internal(bool& valid)
+{
+   valid = !ch.empty();
+   if(!valid)
+   {
+      return static_cast<T0>(0);
+   }
+   const T0 v = _to_payload<T0>(ch.front());
+   return static_cast<T0>(v | (static_cast<T0>(1) << static_cast<T0>(ac_channel_packed<T>::bits)));
+}
+
+/////////////////////////////////////////////////
+// Non-blocking read / peek
+/////////////////////////////////////////////////
+
+template <class T>
+template <class T0>
+__attribute__((noinline)) const T0 ac_channel<T>::_read_bambu_internal(bool& valid, bool& dummy)
+{
+   dummy = false;
+   valid = !ch.empty();
+   if(!valid)
+   {
+      T0 zero;
+      std::memset(&zero, 0, sizeof(T0));
+      return zero;
+   }
+   const T0 v = _to_payload<T0>(ch.front());
+   ch.pop_front();
+   return v;
+}
+
+template <class T>
+template <class T0>
+__attribute__((noinline)) const T0 ac_channel<T>::_peek_bambu_internal(bool& valid, bool& dummy)
+{
+   dummy = false;
+   valid = !ch.empty();
+   if(!valid)
+   {
+      T0 zero;
+      std::memset(&zero, 0, sizeof(T0));
+      return zero;
+   }
+   return _to_payload<T0>(ch.front());
+}
+
+/////////////////////////////////////////////////
+// Write
+/////////////////////////////////////////////////
+
+template <class T>
+template <class T0>
+__attribute__((noinline)) bool ac_channel<T>::_write_bambu_internal(T0 value)
+{
+   AC_CHANNEL_ASSERT(num_free(), ac_channel_exception::write_to_full_channel);
+   T v;
+   _from_payload(v, value);
+   ch.push_back(v);
+   return true;
+}
+
+/////////////////////////////////////////////////
+// Stream and joined-read helpers
+/////////////////////////////////////////////////
 
 template <class T>
 __FORCE_INLINE std::ostream& operator<<(std::ostream& os, ac_channel<T>& a)
@@ -1235,7 +904,6 @@ __FORCE_INLINE std::ostream& operator<<(std::ostream& os, ac_channel<T>& a)
    }
    return os;
 }
-#endif
 
 // This general case is meant to cover non channel (or array of them) args
 //   Its result will be ignored
